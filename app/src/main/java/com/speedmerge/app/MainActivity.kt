@@ -3,14 +3,19 @@ package com.speedmerge.app
 import android.app.AppOpsManager
 import android.app.usage.NetworkStats
 import android.app.usage.NetworkStatsManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.TrafficStats
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Process
+import android.provider.MediaStore
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -34,12 +39,25 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.IOException
+import java.io.RandomAccessFile
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.resume
 
 val Bg = Color(0xFF0E1116)
 val CardBg = Color(0xFF171C24)
@@ -152,12 +170,233 @@ fun networkName(ctx: Context): String {
     }
 }
 
+// ---------- Boosted download (Wi-Fi + mobile data together) ----------
+
+class DlState {
+    val wifi = AtomicLong(0)
+    val mob = AtomicLong(0)
+    @Volatile var total = 0L
+    @Volatile var status = "Starting..."
+    @Volatile var finished = false
+    @Volatile var cancelled = false
+    @Volatile var error: String? = null
+}
+
+class Plan(val url: String, val total: Long, val file: File) {
+    val chunk = 512 * 1024L
+    val chunks = ((total + chunk - 1) / chunk).toInt()
+    val next = AtomicInteger(0)
+    val retry = ConcurrentLinkedQueue<Int>()
+    val done = AtomicInteger(0)
+}
+
+suspend fun requestNet(
+    cm: ConnectivityManager,
+    transport: Int,
+    cbs: MutableList<ConnectivityManager.NetworkCallback>
+): Network? = suspendCancellableCoroutine<Network?> { cont ->
+    val req = NetworkRequest.Builder()
+        .addTransportType(transport)
+        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        .build()
+    val cb = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            if (cont.isActive) cont.resume(network)
+        }
+
+        override fun onUnavailable() {
+            if (cont.isActive) cont.resume(null)
+        }
+    }
+    synchronized(cbs) { cbs.add(cb) }
+    cm.requestNetwork(req, cb, 8000)
+    cont.invokeOnCancellation {
+        try {
+            cm.unregisterNetworkCallback(cb)
+        } catch (ex: Exception) {
+        }
+    }
+}
+
+fun probe(net: Network, url: String): Pair<Long, Boolean> {
+    val c = net.openConnection(URL(url)) as HttpURLConnection
+    try {
+        c.setRequestProperty("Range", "bytes=0-0")
+        c.connectTimeout = 10000
+        c.readTimeout = 10000
+        c.instanceFollowRedirects = true
+        c.connect()
+        val code = c.responseCode
+        val cr = c.getHeaderField("Content-Range")
+        val len = c.contentLengthLong
+        if (code == 206 && cr != null) {
+            val t = cr.substringAfter("/").trim().toLongOrNull() ?: -1L
+            return Pair(t, true)
+        }
+        return Pair(len, false)
+    } finally {
+        c.disconnect()
+    }
+}
+
+fun fetchChunk(net: Network, url: String, start: Long, end: Long, file: File, counter: AtomicLong) {
+    var got = 0L
+    val c = net.openConnection(URL(url)) as HttpURLConnection
+    try {
+        c.setRequestProperty("Range", "bytes=$start-$end")
+        c.connectTimeout = 10000
+        c.readTimeout = 15000
+        c.instanceFollowRedirects = true
+        c.connect()
+        if (c.responseCode != 206) throw IOException("No partial reply")
+        RandomAccessFile(file, "rw").use { raf ->
+            raf.seek(start)
+            val buf = ByteArray(32768)
+            c.inputStream.use { ins ->
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n < 0) break
+                    raf.write(buf, 0, n)
+                    got += n
+                    counter.addAndGet(n.toLong())
+                }
+            }
+        }
+        if (got != end - start + 1) throw IOException("Short chunk")
+    } catch (ex: Exception) {
+        counter.addAndGet(-got)
+        throw ex
+    } finally {
+        c.disconnect()
+    }
+}
+
+fun worker(net: Network, plan: Plan, counter: AtomicLong, st: DlState) {
+    while (!st.cancelled) {
+        val i = plan.retry.poll() ?: plan.next.getAndIncrement()
+        if (i >= plan.chunks) break
+        val start = i * plan.chunk
+        val end = minOf(plan.total - 1, start + plan.chunk - 1)
+        var ok = false
+        var tries = 0
+        while (!ok && tries < 3 && !st.cancelled) {
+            try {
+                fetchChunk(net, plan.url, start, end, plan.file, counter)
+                ok = true
+            } catch (ex: Exception) {
+                tries++
+            }
+        }
+        if (ok) {
+            plan.done.incrementAndGet()
+        } else {
+            plan.retry.add(i)
+            return
+        }
+    }
+}
+
+fun fileNameFrom(url: String): String {
+    val p = url.substringBefore('?').substringBefore('#').trimEnd('/').substringAfterLast('/')
+    return if (p.isBlank() || !p.contains('.')) "boost_download.bin" else p.take(80)
+}
+
+fun runBoost(ctx: Context, url: String, st: DlState) {
+    val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    val cbs = mutableListOf<ConnectivityManager.NetworkCallback>()
+    try {
+        st.status = "Wi-Fi aur mobile data dhoondh raha hai..."
+        val found = runBlocking {
+            val a = async { requestNet(cm, NetworkCapabilities.TRANSPORT_WIFI, cbs) }
+            val b = async { requestNet(cm, NetworkCapabilities.TRANSPORT_CELLULAR, cbs) }
+            Pair(a.await(), b.await())
+        }
+        val wifiNet = found.first
+        val mobNet = found.second
+        if (wifiNet == null && mobNet == null) {
+            st.error = "Koi network nahi mila. Wi-Fi ya mobile data ON karein."
+            return
+        }
+        val nets = mutableListOf<Pair<Network, AtomicLong>>()
+        if (wifiNet != null) nets.add(Pair(wifiNet, st.wifi))
+        if (mobNet != null) nets.add(Pair(mobNet, st.mob))
+        if (nets.size == 1) {
+            st.status = if (wifiNet != null) "Sirf Wi-Fi mila (mobile data ON karein)" else "Sirf mobile data mila (Wi-Fi connect karein)"
+        } else {
+            st.status = "Dono network mil gaye. Probe kar raha hai..."
+        }
+        val probeResult = probe(nets[0].first, url)
+        val total = probeResult.first
+        if (!probeResult.second || total <= 0L) {
+            st.error = "Is link ka server partial download allow nahi karta, ya link direct file ka nahi hai."
+            return
+        }
+        st.total = total
+        val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: ctx.filesDir
+        val name = fileNameFrom(url)
+        val temp = File(dir, "boost_" + System.currentTimeMillis() + ".part")
+        RandomAccessFile(temp, "rw").use { it.setLength(total) }
+        val plan = Plan(url, total, temp)
+        st.status = "Download ho raha hai..."
+        val threads = nets.map { p ->
+            val t = Thread { worker(p.first, plan, p.second, st) }
+            t.start()
+            t
+        }
+        threads.forEach { it.join() }
+        if (plan.done.get() < plan.chunks && !st.cancelled) {
+            for (p in nets) {
+                if (plan.done.get() >= plan.chunks) break
+                worker(p.first, plan, p.second, st)
+            }
+        }
+        if (st.cancelled) {
+            temp.delete()
+            st.status = "Cancel kar diya"
+            return
+        }
+        if (plan.done.get() < plan.chunks) {
+            temp.delete()
+            st.error = "Download poora nahi hua (network toot gaya). Dobara try karein."
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 29) {
+            val values = ContentValues()
+            values.put(MediaStore.Downloads.DISPLAY_NAME, name)
+            values.put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+            values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            val uri = ctx.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw IOException("Downloads mein save nahi ho saka")
+            val out = ctx.contentResolver.openOutputStream(uri) ?: throw IOException("Save nahi ho saka")
+            out.use { o -> temp.inputStream().use { it.copyTo(o) } }
+            temp.delete()
+            st.status = "Ho gaya! Downloads folder mein save hua: $name"
+        } else {
+            val finalFile = File(dir, name)
+            temp.renameTo(finalFile)
+            st.status = "Ho gaya! Saved: " + finalFile.absolutePath
+        }
+    } catch (ex: Exception) {
+        st.error = "Error: " + (ex.message ?: ex.javaClass.simpleName)
+    } finally {
+        for (cb in cbs) {
+            try {
+                cm.unregisterNetworkCallback(cb)
+            } catch (ex: Exception) {
+            }
+        }
+        st.finished = true
+    }
+}
+
+// ---------- Activity ----------
+
 class MainActivity : ComponentActivity() {
     private var granted by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val crashFile = java.io.File(filesDir, "crash.txt")
+        val crashFile = File(filesDir, "crash.txt")
         Thread.setDefaultUncaughtExceptionHandler { _, e ->
             try {
                 crashFile.writeText(android.util.Log.getStackTraceString(e))
@@ -198,10 +437,14 @@ fun Root(granted: Boolean, onGrant: () -> Unit) {
     Surface(modifier = Modifier.fillMaxSize(), color = Bg, contentColor = Fg) {
         Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
             Box(Modifier.weight(1f)) {
-                if (tab == 0) HomeScreen(granted, onGrant) else UsageScreen(granted, onGrant)
+                when (tab) {
+                    0 -> HomeScreen(granted, onGrant)
+                    1 -> UsageScreen(granted, onGrant)
+                    else -> BoostScreen()
+                }
             }
             Row(Modifier.fillMaxWidth()) {
-                listOf("Home", "Usage").forEachIndexed { i, t ->
+                listOf("Home", "Usage", "Boost").forEachIndexed { i, t ->
                     TextButton(onClick = { tab = i }, modifier = Modifier.weight(1f).height(52.dp)) {
                         Text(t, color = if (tab == i) Teal else Muted)
                     }
@@ -292,7 +535,7 @@ fun HomeScreen(granted: Boolean, onGrant: () -> Unit) {
         if (!granted) PermissionCard(onGrant)
         InfoRow(Teal, "Mobile data (SIM 1 + SIM 2)", "Today: " + fmtBytes(mobile))
         InfoRow(Blue, "Wi-Fi", "Today: " + fmtBytes(wifi))
-        InfoRow(Amber, "Speed merge", "Coming soon: dono SIM ki speed jorne ke liye server chahiye.")
+        InfoRow(Amber, "Speed merge", "Boost tab mein Wi-Fi + mobile data dono se file download karein.")
     }
 }
 
@@ -376,5 +619,103 @@ fun UsageScreen(granted: Boolean, onGrant: () -> Unit) {
                 }
             }
         }
+    }
+}
+
+@Composable
+fun BoostScreen() {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var url by remember { mutableStateOf("") }
+    var st by remember { mutableStateOf<DlState?>(null) }
+    var wMbps by remember { mutableStateOf(0.0) }
+    var mMbps by remember { mutableStateOf(0.0) }
+    var wBytes by remember { mutableStateOf(0L) }
+    var mBytes by remember { mutableStateOf(0L) }
+    var total by remember { mutableStateOf(0L) }
+    var status by remember { mutableStateOf("") }
+    var err by remember { mutableStateOf<String?>(null) }
+    var running by remember { mutableStateOf(false) }
+    val cur = st
+    LaunchedEffect(cur) {
+        if (cur != null) {
+            var lw = 0L
+            var lm = 0L
+            while (true) {
+                delay(500)
+                val w = cur.wifi.get()
+                val m = cur.mob.get()
+                wMbps = ((w - lw) * 8 / 0.5 / 1_000_000.0).coerceAtLeast(0.0)
+                mMbps = ((m - lm) * 8 / 0.5 / 1_000_000.0).coerceAtLeast(0.0)
+                lw = w
+                lm = m
+                wBytes = w
+                mBytes = m
+                total = cur.total
+                status = cur.status
+                err = cur.error
+                if (cur.finished) {
+                    running = false
+                    wMbps = 0.0
+                    mMbps = 0.0
+                    break
+                }
+            }
+        }
+    }
+    val frac = if (total > 0L) ((wBytes + mBytes).toFloat() / total).coerceIn(0f, 1f) else 0f
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Text("Boosted download", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        Text(
+            "Ek file Wi-Fi aur mobile data dono se saath download hoti hai. Sirf direct file links (https) ke liye. Browsing ya YouTube tez nahi hoga.",
+            color = Muted, fontSize = 13.sp
+        )
+        OutlinedTextField(
+            value = url,
+            onValueChange = { url = it },
+            label = { Text("Download link (https://...)") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Button(
+            onClick = {
+                if (running) {
+                    st?.cancelled = true
+                } else {
+                    val u = url.trim()
+                    if (u.startsWith("http")) {
+                        val s = DlState()
+                        st = s
+                        running = true
+                        err = null
+                        status = "Starting..."
+                        wBytes = 0L
+                        mBytes = 0L
+                        total = 0L
+                        scope.launch(Dispatchers.IO) { runBoost(ctx.applicationContext, u, s) }
+                    } else {
+                        err = "Poora link daalein (http ya https se shuru)."
+                    }
+                }
+            },
+            modifier = Modifier.fillMaxWidth().height(52.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Teal, contentColor = Bg)
+        ) { Text(if (running) "Cancel" else "Start boosted download", fontWeight = FontWeight.Bold) }
+        Column {
+            Text(String.format(Locale.US, "%.1f", wMbps + mMbps), fontSize = 44.sp, fontWeight = FontWeight.Bold)
+            Text("Mbps combined", color = Muted, fontSize = 13.sp)
+        }
+        InfoRow(Blue, "Wi-Fi", String.format(Locale.US, "%.1f Mbps  |  ", wMbps) + fmtBytes(wBytes))
+        InfoRow(Teal, "Mobile data", String.format(Locale.US, "%.1f Mbps  |  ", mMbps) + fmtBytes(mBytes))
+        Box(Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)).background(Track)) {
+            Box(Modifier.fillMaxWidth(frac).height(8.dp).background(Teal))
+        }
+        if (total > 0L) Text(fmtBytes(wBytes + mBytes) + " / " + fmtBytes(total), color = Muted, fontSize = 13.sp)
+        if (status.isNotEmpty()) Text(status, fontSize = 14.sp)
+        val e = err
+        if (e != null) Text(e, color = Amber, fontSize = 14.sp)
     }
 }
