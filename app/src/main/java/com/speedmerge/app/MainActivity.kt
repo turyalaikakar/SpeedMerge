@@ -157,6 +157,27 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val crashFile = java.io.File(filesDir, "crash.txt")
+        Thread.setDefaultUncaughtExceptionHandler { _, e ->
+            try {
+                crashFile.writeText(android.util.Log.getStackTraceString(e))
+            } catch (ex: Exception) {
+            }
+            Process.killProcess(Process.myPid())
+        }
+        val previous = if (crashFile.exists()) crashFile.readText() else null
+        if (previous != null) {
+            crashFile.delete()
+            setContent {
+                Surface(Modifier.fillMaxSize(), color = Bg, contentColor = Fg) {
+                    Column(Modifier.statusBarsPadding().verticalScroll(rememberScrollState()).padding(16.dp)) {
+                        Text("Crash report - please screenshot this", fontWeight = FontWeight.Bold)
+                        Text(previous.take(2500), fontSize = 11.sp)
+                    }
+                }
+            }
+            return
+        }
         granted = hasUsageAccess(this)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(primary = Teal, background = Bg, surface = Bg)) {
